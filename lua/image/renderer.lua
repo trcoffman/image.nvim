@@ -341,6 +341,25 @@ local render = function(image)
       end
     else
       absolute_x = screen_pos.col - 1
+      -- screenpos() does not account for extmark-based conceal; subtract the concealed
+      -- byte length of earlier ranges so images land on their true display column.
+      if vim.wo[image.window].conceallevel >= 2 then
+        local buf_line = vim.api.nvim_buf_get_lines(image.buffer, original_y, original_y + 1, false)[1] or ""
+        local concealed = 0
+        local marks = vim.api.nvim_buf_get_extmarks(
+          image.buffer, -1, { original_y, 0 }, { original_y, original_x }, { details = true }
+        )
+        for _, m in ipairs(marks) do
+          local d = m[4]
+          if d.conceal then
+            local start_col = m[3]
+            local end_col = d.end_row == original_y and (d.end_col or start_col) or #buf_line
+            if end_col > original_x then end_col = original_x end
+            if end_col > start_col then concealed = concealed + (end_col - start_col) end
+          end
+        end
+        absolute_x = absolute_x - concealed
+      end
       absolute_y = screen_pos.row
     end
     -- apply render_offset_top except for floating windows or during partial scroll
