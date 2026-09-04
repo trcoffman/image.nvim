@@ -29,6 +29,235 @@ local transform_signature_for_request = function(
   }, "|")
 end
 
+local get_source_character_index = function(line, col)
+  if col < 0 or col > #line then return nil end
+
+  local character_index = vim.str_utfindex(line, col)
+  if vim.str_byteindex(line, character_index) ~= col then return nil end
+  return character_index
+end
+
+local is_source_grapheme_continuation = function(line, col, character_index)
+  if col <= 0 or col >= #line then return false end
+
+  local character_end = vim.str_byteindex(line, character_index + 1)
+  return vim.fn.strchars(line:sub(1, col), true) == vim.fn.strchars(line:sub(1, character_end), true)
+end
+
+local conceal_applies_to_row = function(window, row)
+  local mode = vim.api.nvim_get_mode().mode
+  local mode_prefix = mode:sub(1, 1)
+  local current_window = vim.api.nvim_get_current_win()
+
+  if current_window == window and vim.api.nvim_win_get_cursor(window)[1] - 1 == row then
+    local concealcursor_letter = "n"
+    if mode_prefix == "i" or mode_prefix == "R" then
+      concealcursor_letter = "i"
+    elseif mode_prefix == "v" or mode_prefix == "V" or mode_prefix == "\22" then
+      concealcursor_letter = "v"
+    elseif mode_prefix == "c" then
+      concealcursor_letter = "c"
+    end
+    if not vim.wo[window].concealcursor:find(concealcursor_letter, 1, true) then return false end
+  end
+
+  local is_visual_or_select_mode = mode_prefix == "v"
+    or mode_prefix == "V"
+    or mode_prefix == "\22"
+    or mode_prefix == "s"
+    or mode_prefix == "S"
+    or mode_prefix == "\19"
+  if
+    is_visual_or_select_mode
+    and not vim.wo[window].concealcursor:find("v", 1, true)
+    and vim.api.nvim_win_get_buf(current_window) == vim.api.nvim_win_get_buf(window)
+  then
+    local cursor_row = vim.api.nvim_win_get_cursor(current_window)[1] - 1
+    local visual_row = vim.fn.getpos("v")[2] - 1
+    if row >= math.min(cursor_row, visual_row) and row <= math.max(cursor_row, visual_row) then return false end
+  end
+
+  return true
+end
+
+local resolve_concealed_screen_x = function(image, window, win_info, row, col, screen_pos)
+  if
+    not image.buffer
+    or window.buffer ~= image.buffer
+    or screen_pos.row == 0
+    or screen_pos.col == 0
+    or win_info.leftcol > 0
+    or vim.wo[window.id].conceallevel < 2
+  then
+    return nil
+  end
+  if not conceal_applies_to_row(window.id, row) then return nil end
+
+  local line = vim.api.nvim_buf_get_lines(image.buffer, row, row + 1, false)[1] or ""
+  local anchor_character_index = get_source_character_index(line, col)
+  if not anchor_character_index or is_source_grapheme_continuation(line, col, anchor_character_index) then
+    return nil
+  end
+
+  local marks = vim.api.nvim_buf_get_extmarks(
+    image.buffer,
+    -1,
+    { row, 0 },
+    { row, col },
+    { details = true, overlap = true }
+  )
+  local has_conceal_extmark = false
+  for _, mark in ipairs(marks) do
+    local details = mark[4]
+    if details.conceal ~= nil and not details.invalid then
+      has_conceal_extmark = true
+      break
+    end
+  end
+  if not has_conceal_extmark then return nil end
+
+  local segment_start = col
+  local segment_screen_pos = screen_pos
+  for character_index = anchor_character_index - 1, 0, -1 do
+    local source_col = vim.str_byteindex(line, character_index)
+    local position = vim.fn.screenpos(window.id, row + 1, source_col + 1)
+    if position.row == screen_pos.row and position.col > 0 then
+      segment_start = source_col
+      segment_screen_pos = position
+    elseif position.row == 0 or position.row < screen_pos.row then
+      break
+    end
+  end
+
+  local segment_character_index = get_source_character_index(line, segment_start)
+  if not segment_character_index or is_source_grapheme_continuation(line, segment_start, segment_character_index) then
+    return nil
+  end
+
+  -- Syntax and match conceal are not represented by persistent extmarks.
+  local match_conceals_segment = vim.api.nvim_win_call(window.id, function()
+    for _, match in ipairs(vim.fn.getmatches(window.id)) do
+      if match.group == "Conceal" then
+        if match.pattern then
+          -- matchbufline() cannot locate conceal that crosses a line boundary.
+          if
+            match.pattern:find("\\_", 1, true)
+            or match.pattern:find("\\n", 1, true)
+            or match.pattern:find("\n", 1, true)
+          then
+            return true
+          end
+          local engine_selector = match.pattern:sub(1, 5)
+          local matchbufline_pattern = "\\C" .. match.pattern
+          if engine_selector == "\\%#=0" or engine_selector == "\\%#=1" or engine_selector == "\\%#=2" then
+            matchbufline_pattern = engine_selector .. "\\C" .. match.pattern:sub(6)
+          end
+          for _, pattern_match in ipairs(vim.fn.matchbufline(image.buffer, matchbufline_pattern, row + 1, row + 1)) do
+            local match_start = pattern_match.byteidx
+            local match_end = match_start + #pattern_match.text
+            if match_start < col and match_end > segment_start then return true end
+          end
+        else
+          local has_position = false
+          for key, position in pairs(match) do
+            if type(key) == "string" and key:match("^pos%d+$") then
+              has_position = true
+              if position[1] == row + 1 then
+                if position[2] == nil then return true end
+
+                local match_start = position[2] - 1
+                local match_end = match_start + math.max(position[3] or 1, 1)
+                if match_start < col and match_end > segment_start then return true end
+              end
+            end
+          end
+          if not has_position then return true end
+        end
+      end
+    end
+    return false
+  end)
+  if match_conceals_segment then return nil end
+  local syntax_conceals_segment = vim.api.nvim_win_call(window.id, function()
+    for character_index = segment_character_index, anchor_character_index - 1 do
+      local source_col = vim.str_byteindex(line, character_index)
+      if vim.fn.synconcealed(row + 1, source_col + 1)[1] == 1 then return true end
+    end
+    return false
+  end)
+  if syntax_conceals_segment then return nil end
+
+  local concealed_ranges = {}
+  local conceallevel = vim.wo[window.id].conceallevel
+
+  for _, mark in ipairs(marks) do
+    local details = mark[4]
+    if details.conceal ~= nil and not details.invalid then
+      local ends_before_segment = details.end_row == row and details.end_col ~= nil and details.end_col <= segment_start
+      if not ends_before_segment and not (mark[2] == row and mark[3] >= col) then
+        if mark[2] ~= row or details.end_row ~= row or details.end_col == nil then return nil end
+        local range_start = math.max(mark[3], segment_start)
+        local range_end = math.min(details.end_col, col)
+        if range_end > range_start then
+          if conceallevel == 2 and details.conceal ~= "" then return nil end
+          local range_start_character_index = get_source_character_index(line, mark[3])
+          local range_end_character_index = get_source_character_index(line, details.end_col)
+          if
+            not range_start_character_index
+            or not range_end_character_index
+            or is_source_grapheme_continuation(line, mark[3], range_start_character_index)
+            or is_source_grapheme_continuation(line, details.end_col, range_end_character_index)
+          then
+            return nil
+          end
+
+          concealed_ranges[#concealed_ranges + 1] = { start = range_start, finish = range_end }
+        end
+      end
+    end
+  end
+
+  if #concealed_ranges == 0 then return nil end
+  table.sort(concealed_ranges, function(a, b)
+    return a.start < b.start
+  end)
+
+  local merged_ranges = {}
+  for _, range in ipairs(concealed_ranges) do
+    local previous = merged_ranges[#merged_ranges]
+    if previous and range.start <= previous.finish then
+      previous.finish = math.max(previous.finish, range.finish)
+    else
+      merged_ranges[#merged_ranges + 1] = range
+    end
+  end
+
+  if line:sub(merged_ranges[1].start + 1, col):find("\t", 1, true) then return nil end
+
+  local hidden_width = 0
+  for _, range in ipairs(merged_ranges) do
+    local hidden_text = line:sub(range.start + 1, range.finish)
+    local range_width = vim.fn.strdisplaywidth(hidden_text)
+    -- Wide concealed graphemes can change the wrapped row without updating screenpos().
+    if segment_start > 0 and range_width ~= vim.fn.strchars(hidden_text, true) then return nil end
+    hidden_width = hidden_width + range_width
+  end
+
+  local raw_width = screen_pos.col - segment_screen_pos.col
+  local visible_width = raw_width - hidden_width
+  if visible_width < 0 then return nil end
+
+  if vim.wo[window.id].rightleft then
+    local window_left = win_info.wincol - 1
+    local text_left = window_left + win_info.textoff
+    local text_right = window_left + (win_info.width - win_info.textoff) - 1
+    local continuation_prefix = segment_screen_pos.col - 1 - text_left
+    return text_right - continuation_prefix - visible_width
+  end
+
+  return segment_screen_pos.col - 1 + visible_width
+end
+
 -- FIXME: having multiple instances of the same image that are bounded to
 --  different sizes cause the virt_line calculations to break (i think the
 --  height gets miss calculated)
@@ -341,6 +570,10 @@ local render = function(image)
       end
     else
       absolute_x = screen_pos.col - 1
+      if window and not window.is_floating then
+        absolute_x = resolve_concealed_screen_x(image, window, win_info, original_y, original_x, screen_pos)
+          or absolute_x
+      end
       absolute_y = screen_pos.row
     end
     -- apply render_offset_top except for floating windows or during partial scroll
